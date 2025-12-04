@@ -1,7 +1,3 @@
-################################################################################
-# Copyright (C) 2023 Jiayi Guo, Xingqian Xu, Manushree Vasu - All Rights Reserved                         #
-################################################################################
-
 import gradio as gr
 import os
 import os.path as osp
@@ -29,9 +25,6 @@ version = "Smooth Diffusion Demo v1.0"
 refresh_symbol = "\U0001f504" # 🔄
 recycle_symbol = '\U0000267b' #
 
-##############
-# model_book #
-##############
 
 choices = edict()
 choices.diffuser = OrderedDict([
@@ -68,9 +61,6 @@ default.nullinv_inner_step = 10
 default.threshold = 0.8
 default.variation = 0.8
 
-##########
-# helper #
-##########
 
 def lerp(t, v0, v1):
     if isinstance(t, float):
