@@ -1,1 +1,1 @@
-# SmootherDiffusion
+# Smoother Diffusion
