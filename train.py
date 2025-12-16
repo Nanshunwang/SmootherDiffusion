@@ -35,6 +35,290 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 from torch import nn, autograd, optim
 
+class LocalAdaIN(nn.Module):
+    """
+    Local Adaptive Instance Normalization for spatial feature alignment.
+    Applies AdaIN locally using spatial attention masks.
+    """
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+    
+    def calc_mean_std(self, feat, mask=None, eps=1e-5):
+        """
+        Calculate mean and std with optional spatial masking.
+        Args:
+            feat: features of shape (B, C, H, W)
+            mask: optional mask of shape (B, 1, H, W) or (B, H, W)
+            eps: small value for numerical stability
+        """
+        B, C, H, W = feat.size()
+        
+        if mask is not None:
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)  # (B, 1, H, W)
+            mask = mask.expand(B, C, H, W)
+            
+            # Masked statistics
+            feat_masked = feat * mask
+            sum_mask = mask.sum(dim=[2, 3], keepdim=True).clamp(min=1.0)
+            
+            feat_mean = feat_masked.sum(dim=[2, 3], keepdim=True) / sum_mask
+            feat_var = ((feat_masked - feat_mean * mask) ** 2).sum(dim=[2, 3], keepdim=True) / sum_mask
+            feat_std = (feat_var + eps).sqrt()
+        else:
+            # Global statistics
+            feat_mean = feat.mean(dim=[2, 3], keepdim=True)
+            feat_std = feat.std(dim=[2, 3], keepdim=True) + eps
+        
+        return feat_mean, feat_std
+    
+    def forward(self, content_feat, style_feat, content_mask=None, style_mask=None):
+        """
+        Apply local AdaIN.
+        Args:
+            content_feat: content features (B, C, H, W)
+            style_feat: style features (B, C, H, W)
+            content_mask: optional mask for content (B, 1, H, W) or (B, H, W)
+            style_mask: optional mask for style (B, 1, H, W) or (B, H, W)
+        Returns:
+            Normalized and styled features
+        """
+        assert content_feat.size()[:2] == style_feat.size()[:2], \
+            f"Content and style must have same batch and channel size"
+        
+        # Calculate statistics
+        content_mean, content_std = self.calc_mean_std(content_feat, content_mask, self.eps)
+        style_mean, style_std = self.calc_mean_std(style_feat, style_mask, self.eps)
+        
+        # Normalize content features
+        normalized = (content_feat - content_mean) / content_std
+        
+        # Apply style statistics
+        stylized = normalized * style_std + style_mean
+        
+        return stylized
+
+
+def create_spatial_mask(latents, threshold=0.5, kernel_size=3):
+    """
+    Create spatial attention masks based on feature magnitude.
+    Args:
+        latents: latent features (B, C, H, W)
+        threshold: percentile threshold for mask creation
+        kernel_size: size for morphological operations
+    Returns:
+        Binary mask (B, 1, H, W)
+    """
+    B, C, H, W = latents.size()
+    
+    # Calculate feature magnitude
+    magnitude = latents.norm(dim=1, keepdim=True)  # (B, 1, H, W)
+    
+    # Create threshold-based mask
+    threshold_val = torch.quantile(magnitude.view(B, -1), threshold, dim=1, keepdim=True)
+    threshold_val = threshold_val.view(B, 1, 1, 1)
+    mask = (magnitude > threshold_val).float()
+    
+    # Optional: smooth mask with average pooling
+    if kernel_size > 1:
+        padding = kernel_size // 2
+        mask = F.avg_pool2d(mask, kernel_size, stride=1, padding=padding)
+        mask = (mask > 0.5).float()
+    
+    return mask
+
+
+# Add this to the parse_args() function:
+def parse_args():
+    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    # ... existing arguments ...
+    
+    # Add AdaIN-specific arguments
+    parser.add_argument(
+        "--use_adain",
+        action="store_true",
+        help="Whether to use local AdaIN regularization during training."
+    )
+    parser.add_argument(
+        "--adain_weight",
+        type=float,
+        default=0.1,
+        help="Weight for AdaIN loss term."
+    )
+    parser.add_argument(
+        "--adain_layers",
+        type=str,
+        default="all",
+        choices=["all", "decoder", "encoder"],
+        help="Which layers to apply AdaIN to."
+    )
+    parser.add_argument(
+        "--adain_mask_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold for creating spatial masks in AdaIN."
+    )
+    
+    # ... rest of parse_args ...
+    return args
+
+
+# Modify the training loop in main() to include AdaIN:
+def main():
+    args = parse_args()
+    # ... existing setup code ...
+    
+    # Initialize AdaIN module if enabled
+    adain_module = None
+    if args.use_adain:
+        adain_module = LocalAdaIN().to(accelerator.device)
+        logger.info("Local AdaIN enabled for training")
+    
+    # ... existing training setup ...
+    
+    for epoch in range(first_epoch, args.num_train_epochs):
+        unet.train()
+        train_loss = 0.0
+        train_reg_loss = 0.0
+        train_adain_loss = 0.0  # Track AdaIN loss
+        
+        for step, batch in enumerate(train_dataloader):
+            # ... existing code until model prediction ...
+            
+            with accelerator.accumulate(unet):
+                # Convert images to latent space
+                latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
+                
+                # Sample noise
+                noise = torch.randn_like(latents)
+                noise.requires_grad_(True)
+                
+                if args.noise_offset:
+                    noise += args.noise_offset * torch.randn(
+                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                    )
+                
+                bsz = latents.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
+                
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                
+                # Get prediction target
+                if args.prediction_type is not None:
+                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+                
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                
+                # Predict the noise residual
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                
+                # Main denoising loss
+                if args.snr_gamma is None:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                else:
+                    snr = compute_snr(timesteps)
+                    mse_loss_weights = (
+                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                    )
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                    loss = loss.mean()
+                
+                # Apply AdaIN loss if enabled
+                adain_loss = torch.tensor(0.0, device=accelerator.device)
+                if args.use_adain and adain_module is not None:
+                    # Denoise to get predicted clean latents
+                    fake_img, sqrt_one_minus_alpha_prod = de_noise(noisy_latents, model_pred, timesteps)
+                    
+                    # Create spatial masks for local AdaIN
+                    content_mask = create_spatial_mask(fake_img, threshold=args.adain_mask_threshold)
+                    style_mask = create_spatial_mask(latents, threshold=args.adain_mask_threshold)
+                    
+                    # Apply local AdaIN between predicted and target latents
+                    stylized_latents = adain_module(
+                        content_feat=fake_img,
+                        style_feat=latents,
+                        content_mask=content_mask,
+                        style_mask=style_mask
+                    )
+                    
+                    # Calculate AdaIN consistency loss
+                    adain_loss = F.mse_loss(stylized_latents, latents, reduction="mean")
+                
+                # Existing regularization loss
+                fake_img, sqrt_one_minus_alpha_prod = de_noise(noisy_latents, model_pred, timesteps)
+                reg_loss, mean_reg_variation, reg_variations = step_regularize(
+                    fake_img, noise, mean_reg_variation, sqrt_one_minus_alpha_prod
+                )
+                
+                # Combine all losses
+                loss_total = loss + args.lambda_reg * reg_loss
+                if args.use_adain:
+                    loss_total = loss_total + args.adain_weight * adain_loss
+                
+                # Gather losses for logging
+                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                
+                avg_reg_loss = accelerator.gather(reg_loss.repeat(args.train_batch_size)).mean()
+                train_reg_loss += avg_reg_loss.item() / args.gradient_accumulation_steps
+                
+                if args.use_adain:
+                    avg_adain_loss = accelerator.gather(adain_loss.repeat(args.train_batch_size)).mean()
+                    train_adain_loss += avg_adain_loss.item() / args.gradient_accumulation_steps
+                
+                # Backpropagate
+                accelerator.backward(loss_total)
+                if accelerator.sync_gradients:
+                    params_to_clip = lora_layers.parameters()
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+            
+            # Update progress
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+                log_dict = {
+                    "train_loss": train_loss,
+                    "train_reg_loss": train_reg_loss
+                }
+                if args.use_adain:
+                    log_dict["train_adain_loss"] = train_adain_loss
+                
+                accelerator.log(log_dict, step=global_step)
+                train_loss = 0.0
+                train_reg_loss = 0.0
+                train_adain_loss = 0.0
+                
+                # ... existing checkpointing code ...
+            
+            # Update logs
+            logs = {
+                "step_loss": loss.detach().item(),
+                "reg_loss": reg_loss.detach().item(),
+                "reg_variation": reg_variations.mean().detach().item(),
+                "mean_reg_variation": mean_reg_variation.item(),
+                "lr": lr_scheduler.get_last_lr()[0]
+            }
+            if args.use_adain:
+                logs["adain_loss"] = adain_loss.detach().item()
+            
+            accelerator.print(logs)
+            progress_bar.set_postfix(**logs)
+            
+            if global_step >= args.max_train_steps:
+                break
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.18.0.dev0")
